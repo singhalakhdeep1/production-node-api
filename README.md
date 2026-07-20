@@ -107,3 +107,9 @@ LOG_LEVEL=info
 | Metrics            | Prometheus `/metrics` endpoint   |
 | Load balancing     | Nginx reverse proxy              |
 | CI/CD              | GitHub Actions                   |
+
+---
+
+## 📝 License
+
+Proprietary - All rights reserved.
