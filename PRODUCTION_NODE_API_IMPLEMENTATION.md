@@ -70,24 +70,9 @@ This document describes the monitoring and observability integrations added to P
 - `monitoring/datadog.ts` - Datadog APM tracing and metrics
 - `monitoring/pagerduty.ts` - PagerDuty incident management
 
-## Installation Required
+## Installation
 
-Add to `package.json`:
-```json
-{
-  "dependencies": {
-    "axios": "^1.6.0",
-    "aws-sdk": "^2.1500.0",
-    "dd-trace": "^4.0.0",
-    "node-dogstatsd": "^0.4.0"
-  }
-}
-```
-
-Run:
-```bash
-npm install
-```
+All packages are declared in `package.json` (`@aws-sdk/client-cloudwatch`, `@aws-sdk/client-cloudwatch-logs`, `dd-trace`; Loki, Tempo and PagerDuty use the built-in `fetch`). `npm install` is all that is needed. Sinks are wired in `monitoring/index.ts` and each is enabled only when its environment variables are set.
 
 ## Environment Variables
 
@@ -95,16 +80,20 @@ npm install
 # Grafana Loki
 LOKI_URL=http://localhost:3100
 
-# Tempo
+# Tempo (query API and OTLP/HTTP receiver)
 TEMPO_URL=http://localhost:3200
+TEMPO_OTLP_URL=http://localhost:4318
 
 # AWS CloudWatch
-AWS_REGION=us-east-1
+CLOUDWATCH_ENABLED=true
+CLOUDWATCH_REGION=us-east-1
+CLOUDWATCH_LOG_GROUP=node-api-logs
 AWS_ACCESS_KEY_ID=your_access_key
 AWS_SECRET_ACCESS_KEY=your_secret_key
 
 # Datadog
-DD_SERVICE=node-api
+DD_TRACE_ENABLED=true
+DD_SERVICE=production-api
 DD_ENV=production
 DD_AGENT_HOST=localhost
 DD_TRACE_AGENT_PORT=8126
@@ -115,12 +104,8 @@ PAGERDUTY_INTEGRATION_KEY=your_integration_key
 ```
 
 ## Notes
-- All code is written but packages are not installed (per user request)
-- Loki requires Grafana Loki server
-- Tempo requires Tempo server
-- CloudWatch requires AWS credentials
-- Datadog requires Datadog Agent
-- PagerDuty requires API and integration key
-- All services support middleware integration
-- Tracing spans support hierarchical relationships
-- Metrics support custom dimensions/tags
+- Every sink call goes through its own circuit breaker; a failing backend never slows down or fails API requests.
+- Tempo receives OTLP/HTTP JSON on `/v1/traces` (port 4318); traces can be read back at `/api/ops/traces/:traceId`.
+- Loki receives batched pushes every second; query them at `/api/ops/logs`.
+- PagerDuty incidents are deduplicated per key and throttled for 5 minutes while open.
+- Verified against stub backends (Loki push/query, OTLP, PagerDuty Events v2, CloudWatch and CloudWatch Logs JSON protocols). Not verified against real AWS, Datadog or PagerDuty accounts.

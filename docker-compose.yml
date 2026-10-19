@@ -1,0 +1,128 @@
+# Full local stack: 3 API replicas behind nginx, Postgres, Redis, the dashboard,
+# and the monitoring stack (Prometheus + Alertmanager + node-exporter, Grafana, Loki, Tempo).
+#   docker compose up -d --build
+#   API (via nginx)  http://localhost:8080      Dashboard  http://localhost:3102
+#   Grafana          http://localhost:3000      Prometheus http://localhost:9090
+x-api: &api
+  build: .
+  restart: unless-stopped
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    NODE_ENV: production
+    PORT: 5000
+    PM2_INSTANCES: 2
+    DATABASE_URL: postgresql://postgres:postgres@postgres:5432/production_api
+    REDIS_URL: redis://redis:6379
+    JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+    ADMIN_EMAILS: ${ADMIN_EMAILS:-}
+    ALERT_WEBHOOK_TOKEN: ${ALERT_WEBHOOK_TOKEN:-change-me}
+    TRUST_PROXY: "true"
+    CORS_ORIGINS: http://localhost:3102
+    LOKI_URL: http://loki:3100
+    TEMPO_URL: http://tempo:3200
+    TEMPO_OTLP_URL: http://tempo:4318
+    UPLOAD_PATH: /app/uploads
+  volumes:
+    - uploads:/app/uploads
+  depends_on:
+    postgres: { condition: service_healthy }
+    redis: { condition: service_healthy }
+
+services:
+  api1:
+    <<: *api
+    hostname: api1
+  api2:
+    <<: *api
+    hostname: api2
+  api3:
+    <<: *api
+    hostname: api3
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports: ["8080:80"]
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on: [api1, api2, api3]
+
+  frontend:
+    build:
+      context: ./frontend-test
+      args:
+        NEXT_PUBLIC_API_URL: http://localhost:8080
+    restart: unless-stopped
+    ports: ["3102:3102"]
+    depends_on: [nginx]
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: production_api
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redisdata:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      retries: 10
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    restart: unless-stopped
+    ports: ["9090:9090"]
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    restart: unless-stopped
+    ports: ["9093:9093"]
+    volumes:
+      - ./monitoring/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+
+  node-exporter:
+    image: prom/node-exporter:v1.8.2
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.3.0
+    restart: unless-stopped
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  loki:
+    image: grafana/loki:3.2.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/loki/local-config.yaml"]
+
+  tempo:
+    image: grafana/tempo:2.6.1
+    restart: unless-stopped
+    command: ["-config.file=/etc/tempo.yml"]
+    volumes:
+      - ./monitoring/tempo.yml:/etc/tempo.yml:ro
+
+volumes:
+  pgdata:
+  redisdata:
+  uploads:

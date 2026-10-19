@@ -8,7 +8,7 @@ This document provides comprehensive documentation for HLD/LLD patterns implemen
 ### LLD Topics (Low-Level Design)
 
 #### 1. Health Checking
-**Location:** `src/services/health-check/health-check.service.js`
+**Location:** `src/services/health-check/health-check.service.ts`
 
 **Description:** Implements comprehensive health checking for production monitoring with liveness and readiness probes.
 
@@ -19,8 +19,8 @@ This document provides comprehensive documentation for HLD/LLD patterns implemen
 - Degraded state detection
 
 **Usage Example:**
-```javascript
-const HealthCheckService = require('./src/services/health-check/health-check.service');
+```typescript
+import { HealthCheckService } from './src/services/health-check/health-check.service';
 
 const healthCheck = new HealthCheckService();
 
@@ -33,7 +33,7 @@ const result = await healthCheck.performHealthCheck();
 ```
 
 #### 2. API Rate Limiting
-**Location:** `src/services/rate-limiting/rate-limiting.service.js`
+**Location:** `src/services/rate-limiting/rate-limiting.service.ts`
 
 **Description:** Implements token bucket algorithm for API rate limiting.
 
@@ -44,8 +44,8 @@ const result = await healthCheck.performHealthCheck();
 - Automatic cleanup
 
 **Usage Example:**
-```javascript
-const RateLimitingService = require('./src/services/rate-limiting/rate-limiting.service');
+```typescript
+import { RateLimitingService } from './src/services/rate-limiting/rate-limiting.service';
 
 const rateLimiting = new RateLimitingService({ bucketCapacity: 100, refillRate: 1.0 });
 
@@ -57,7 +57,7 @@ if (rateLimiting.isAllowed(`user:${userId}`, 1)) {
 ```
 
 #### 3. Circuit Breaker Pattern
-**Location:** `src/services/circuit-breaker/circuit-breaker.service.js`
+**Location:** `src/services/circuit-breaker/circuit-breaker.service.ts`
 
 **Description:** Implements circuit breaker pattern for fault tolerance.
 
@@ -68,8 +68,8 @@ if (rateLimiting.isAllowed(`user:${userId}`, 1)) {
 - Manual reset/trip support
 
 **Usage Example:**
-```javascript
-const CircuitBreakerService = require('./src/services/circuit-breaker/circuit-breaker.service');
+```typescript
+import { CircuitBreakerService } from './src/services/circuit-breaker/circuit-breaker.service';
 
 const circuitBreaker = new CircuitBreakerService({ failureThreshold: 5 });
 
@@ -79,7 +79,7 @@ const result = await circuitBreaker.execute(async () => {
 ```
 
 #### 4. Structured Logging
-**Location:** `src/services/structured-logging/structured-logging.service.js`
+**Location:** `src/services/structured-logging/structured-logging.service.ts`
 
 **Description:** Implements structured logging with correlation IDs and context.
 
@@ -90,52 +90,55 @@ const result = await circuitBreaker.execute(async () => {
 - Audit event logging
 
 **Usage Example:**
-```javascript
-const StructuredLoggingService = require('./src/services/structured-logging/structured-logging.service');
+```typescript
+import { StructuredLoggingService, structuredLogger } from './src/services/structured-logging/structured-logging.service';
 
-const logging = new StructuredLoggingService();
-
-logging.setContext({
-  correlationId: StructuredLoggingService.createCorrelationId(),
-  userId: userId,
-  requestId: requestId
-});
-
-logging.logInformation('Request received', { endpoint: '/api/users' });
-logging.logAuditEvent('UserLoggedIn', 'User logged in', { userId });
+// The request-context middleware does this for every request.
+StructuredLoggingService.runWithContext(
+  { correlationId: StructuredLoggingService.createCorrelationId(), userId, requestId },
+  () => {
+    structuredLogger.logInformation('Request received', { endpoint: '/api/todos' });
+    structuredLogger.logAuditEvent('UserLoggedIn', 'User logged in', { userId });
+  },
+);
 ```
 
 ### HLD Topics (High-Level Design)
 
 #### 1. Distributed Tracing (Tempo)
-**Location:** `monitoring/tempo.ts` (Already exists)
+**Location:** `monitoring/tempo.ts`, `src/tracing/tracer.ts`
 
-**Description:** Distributed tracing for production observability.
+**Description:** Every request gets a server span (W3C `traceparent` honoured, `X-Trace-ID` returned) with child spans for SQL queries and GraphQL operations, exported to Tempo as OTLP/HTTP JSON. Enabled by `TEMPO_OTLP_URL` / `TEMPO_URL`.
 
 #### 2. Metrics Collection (Prometheus)
-**Location:** `monitoring/prometheus.yml` (Already exists)
+**Location:** `src/metrics.ts`, `monitoring/prometheus.yml`, `monitoring/alerts.yml`, `monitoring/grafana/`
 
-**Description:** Prometheus metrics collection for monitoring.
+**Description:** `/metrics` exposes HTTP, cache, DB pool, breaker, WebSocket, GraphQL, auth and rate-limit metrics; alert rules route through Alertmanager to PagerDuty; Grafana is provisioned with a dashboard.
 
 #### 3. Log Aggregation (Loki)
-**Location:** `monitoring/loki.ts` (Already exists)
+**Location:** `monitoring/loki.ts`
 
-**Description:** Log aggregation for production logs.
+**Description:** A Winston transport batches structured logs to Loki's push API (labels: job, level, environment, instance); LogQL queries are available at `/api/ops/logs`. Enabled by `LOKI_URL`.
 
 #### 4. Cloud Monitoring (CloudWatch)
-**Location:** `monitoring/cloudwatch.ts` (Already exists)
+**Location:** `monitoring/cloudwatch.ts`
 
-**Description:** AWS CloudWatch integration for cloud monitoring.
+**Description:** AWS SDK v3. Per-minute RequestCount / ServerErrors / ResponseTime per route, warn+ logs to a log group, alarm helper. Enabled by `CLOUDWATCH_ENABLED=true`.
 
 #### 5. APM Monitoring (Datadog)
-**Location:** `monitoring/datadog.ts` (Already exists)
+**Location:** `src/tracing/datadog-init.ts`, `monitoring/datadog.ts`
 
-**Description:** Datadog APM integration for application monitoring.
+**Description:** dd-trace is loaded before anything else so it auto-instruments express, pg, redis and http; request metrics go out via DogStatsD. Enabled by `DD_TRACE_ENABLED=true`.
 
 #### 6. Incident Management (PagerDuty)
-**Location:** `monitoring/pagerduty.ts` (Already exists)
+**Location:** `monitoring/pagerduty.ts`, `monitoring/index.ts`
 
-**Description:** PagerDuty integration for incident management and alerting.
+**Description:** Events API v2 with dedup keys and throttling. Incidents for unhandled 5xx, high latency, high error rate, database/redis breakers opening, and Alertmanager alerts (`POST /api/ops/alertmanager`); manual trigger/ack/resolve in the ops API. Enabled by `PAGERDUTY_INTEGRATION_KEY`.
+
+## As built
+
+- The four LLD services are TypeScript classes used by the running app: health checks back `/api/health` (`/live`, `/ready`); the token bucket limits each user / API key; circuit breakers guard PostgreSQL health probes, Redis and every monitoring sink (state at `/api/ops/status` and in `circuit_breaker_state`); structured logging carries correlation id, user and trace id through async calls with AsyncLocalStorage.
+- The API is a Todo service (users, todos, API keys, uploads) on PostgreSQL with a Redis-backed cache, REST + GraphQL + WebSocket interfaces; see README.md.
 
 ## Architecture
 

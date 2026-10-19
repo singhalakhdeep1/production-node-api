@@ -1,9 +1,14 @@
 node_modules
+dist
 .git
-.gitignore
+.github
 .env
+.env.*
+!.env.example
 .vscode
 coverage
-dist
-build
+logs
+uploads
 *.log
+frontend-test
+tests

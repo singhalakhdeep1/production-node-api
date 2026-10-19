@@ -1,0 +1,7 @@
+apiVersion: 1
+providers:
+  - name: production-api
+    folder: Production API
+    type: file
+    options:
+      path: /var/lib/grafana/dashboards

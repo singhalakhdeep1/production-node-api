@@ -67,13 +67,17 @@ function TodoRow({ todo, onChange }: { todo: Todo; onChange: () => void }) {
   const [description, setDescription] = useState(todo.description ?? '');
   const [open, setOpen] = useState(false);
   const [error, setError] = useState('');
+  // Optimistic completion state so the checkbox responds immediately.
+  const [completed, setCompleted] = useState(todo.completed);
 
   const patch = async (body: Partial<Todo>) => {
+    if (body.completed !== undefined) setCompleted(body.completed);
     try {
       await apiFetch(`/api/todos/${todo.id}`, { method: 'PATCH', body });
       setEditing(false);
       onChange();
     } catch (e) {
+      if (body.completed !== undefined) setCompleted(!body.completed);
       setError(errorMessage(e));
     }
   };
@@ -88,8 +92,8 @@ function TodoRow({ todo, onChange }: { todo: Todo; onChange: () => void }) {
   };
 
   return (
-    <div className={`todo ${todo.completed ? 'done' : ''}`} data-testid="todo-row">
-      <input type="checkbox" checked={todo.completed} aria-label={`complete ${todo.title}`} onChange={() => patch({ completed: !todo.completed })} />
+    <div className={`todo ${completed ? 'done' : ''}`} data-testid="todo-row">
+      <input type="checkbox" checked={completed} aria-label={`complete ${todo.title}`} onChange={() => patch({ completed: !completed })} />
       <div className="body">
         {error && <div className="alert">{error}</div>}
         {editing ? (

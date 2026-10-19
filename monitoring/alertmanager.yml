@@ -1,0 +1,18 @@
+# Alertmanager: forwards Prometheus alerts to the API's webhook, which raises PagerDuty incidents.
+# The bearer token must match ALERT_WEBHOOK_TOKEN on the API.
+route:
+  receiver: api-pagerduty-bridge
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+
+receivers:
+  - name: api-pagerduty-bridge
+    webhook_configs:
+      - url: http://nginx/api/ops/alertmanager
+        send_resolved: true
+        http_config:
+          authorization:
+            type: Bearer
+            credentials: change-me
