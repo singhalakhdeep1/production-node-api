@@ -1,0 +1,78 @@
+:root {
+  --bg: #f6f7f9;
+  --card: #ffffff;
+  --text: #1c2430;
+  --muted: #64707d;
+  --border: #dde2e8;
+  --accent: #2f6fdf;
+  --accent-text: #ffffff;
+  --ok: #1f8a4c;
+  --warn: #b7791f;
+  --bad: #c53030;
+  --code: #f1f3f6;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #12161c;
+    --card: #1a2029;
+    --text: #e4e8ee;
+    --muted: #9aa5b1;
+    --border: #2c3542;
+    --accent: #5b8ff0;
+    --code: #222a35;
+  }
+}
+
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.5 system-ui, -apple-system, 'Segoe UI', sans-serif; }
+a { color: var(--accent); }
+h1 { font-size: 24px; margin: 0 0 16px; }
+h2 { font-size: 17px; margin: 0 0 12px; }
+code, pre { font-family: ui-monospace, 'Cascadia Code', Consolas, monospace; font-size: 13px; }
+pre { background: var(--code); padding: 12px; border-radius: 6px; overflow: auto; max-height: 420px; margin: 0; }
+
+.nav { display: flex; align-items: center; gap: 24px; padding: 10px 24px; background: var(--card); border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.nav .brand { font-weight: 700; color: var(--text); text-decoration: none; }
+.nav nav { display: flex; gap: 4px; flex-wrap: wrap; }
+.nav nav a { padding: 6px 10px; border-radius: 6px; color: var(--muted); text-decoration: none; }
+.nav nav a.active, .nav nav a:hover { background: var(--code); color: var(--text); }
+.nav-user { margin-left: auto; display: flex; gap: 10px; align-items: center; }
+
+.container { max-width: 1100px; margin: 0 auto; padding: 24px 16px 64px; }
+.grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); }
+.card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 18px; margin-bottom: 16px; }
+.row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.stack { display: flex; flex-direction: column; gap: 10px; }
+.muted { color: var(--muted); }
+.small { font-size: 13px; }
+.spacer { flex: 1; }
+
+input, select, textarea { font: inherit; color: var(--text); background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 7px 10px; }
+textarea { width: 100%; min-height: 120px; font-family: ui-monospace, Consolas, monospace; font-size: 13px; }
+label { display: flex; flex-direction: column; gap: 4px; font-size: 13px; color: var(--muted); }
+
+.btn { display: inline-block; font: inherit; border: 1px solid var(--accent); background: var(--accent); color: var(--accent-text); padding: 7px 14px; border-radius: 6px; cursor: pointer; text-decoration: none; }
+.btn:disabled { opacity: 0.55; cursor: not-allowed; }
+.btn.ghost { background: transparent; color: var(--text); border-color: var(--border); }
+.btn.danger { background: var(--bad); border-color: var(--bad); }
+.btn.small { padding: 3px 9px; font-size: 13px; }
+
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--border); }
+.badge.ok { color: var(--ok); border-color: var(--ok); }
+.badge.warn { color: var(--warn); border-color: var(--warn); }
+.badge.bad { color: var(--bad); border-color: var(--bad); }
+
+.alert { padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid var(--bad); color: var(--bad); }
+.notice { padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; border: 1px solid var(--ok); color: var(--ok); word-break: break-all; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 6px; border-bottom: 1px solid var(--border); vertical-align: top; }
+th { font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); }
+
+.todo { display: flex; gap: 12px; padding: 10px 0; border-bottom: 1px solid var(--border); align-items: flex-start; }
+.todo.done .title { text-decoration: line-through; color: var(--muted); }
+.todo .body { flex: 1; min-width: 0; }
+.stat { font-size: 26px; font-weight: 700; }
+.feed { max-height: 260px; overflow: auto; font-size: 13px; }
+.feed div { padding: 4px 0; border-bottom: 1px dashed var(--border); }

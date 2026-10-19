@@ -1,172 +1,144 @@
-// PagerDuty integration for production-node-api
+// PagerDuty integration: Events API v2 (trigger/acknowledge/resolve) and REST API reads.
+import { config } from '../src/config';
+import { CircuitBreakerService } from '../src/services/circuit-breaker/circuit-breaker.service';
+import { sinkRequest } from './http';
 
-const axios = require('axios');
+export type Severity = 'critical' | 'error' | 'warning' | 'info';
 
-class PagerDutyService {
-  constructor(apiKey, integrationKey) {
-    this.apiKey = apiKey;
-    this.integrationKey = integrationKey;
-    this.baseUrl = 'https://api.pagerduty.com';
+export interface IncidentInput {
+  summary: string;
+  severity?: Severity;
+  source?: string;
+  dedupKey: string;
+  details?: Record<string, unknown>;
+}
+
+export interface IncidentRecord {
+  dedupKey: string;
+  summary: string;
+  severity: Severity;
+  status: 'triggered' | 'acknowledged' | 'resolved';
+  lastEventAt: string;
+  count: number;
+}
+
+export class PagerDutyService {
+  readonly breaker = new CircuitBreakerService({ name: 'pagerduty', failureThreshold: 3, resetTimeout: 60000 });
+  private incidents = new Map<string, IncidentRecord>();
+  private lastSent = new Map<string, number>();
+
+  constructor(
+    private readonly apiKey: string,
+    private readonly integrationKey: string,
+    private readonly eventsUrl = config.monitoring.pagerdutyEventsUrl,
+    private readonly baseUrl = config.monitoring.pagerdutyApiUrl,
+    private readonly throttleMs = 5 * 60 * 1000,
+  ) {}
+
+  private sendEvent(body: Record<string, unknown>) {
+    return sinkRequest<{ status: string; dedup_key: string; message: string }>('pagerduty', this.breaker, this.eventsUrl, {
+      body: { routing_key: this.integrationKey, ...body },
+    });
   }
 
-  async triggerIncident(incident) {
-    const payload = {
-      routing_key: this.integrationKey,
+  /** Triggers (or re-triggers) an incident. Repeats of the same dedup key are throttled. */
+  async triggerIncident(incident: IncidentInput, { force = false } = {}) {
+    const existing = this.incidents.get(incident.dedupKey);
+    const last = this.lastSent.get(incident.dedupKey) ?? 0;
+    if (!force && existing?.status === 'triggered' && Date.now() - last < this.throttleMs) {
+      existing.count++;
+      return { success: true, throttled: true, dedupKey: incident.dedupKey };
+    }
+    const severity = incident.severity ?? 'critical';
+    const data = await this.sendEvent({
       event_action: 'trigger',
       dedup_key: incident.dedupKey,
       payload: {
-        summary: incident.summary,
-        severity: incident.severity || 'critical',
-        source: incident.source || 'node-api',
+        summary: incident.summary.slice(0, 1024),
+        severity,
+        source: incident.source ?? `${config.serviceName}@${config.instance}`,
+        component: config.serviceName,
         timestamp: new Date().toISOString(),
-        custom_details: incident.details || {}
-      }
-    };
-
-    try {
-      const response = await axios.post(
-        'https://events.pagerduty.com/v2/enqueue',
-        payload
-      );
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Error triggering PagerDuty incident:', error);
-      return { success: false, error: error.message };
-    }
+        custom_details: incident.details ?? {},
+      },
+    });
+    this.lastSent.set(incident.dedupKey, Date.now());
+    this.incidents.set(incident.dedupKey, {
+      dedupKey: incident.dedupKey,
+      summary: incident.summary,
+      severity,
+      status: 'triggered',
+      lastEventAt: new Date().toISOString(),
+      count: (existing?.count ?? 0) + 1,
+    });
+    return { success: true, throttled: false, dedupKey: data.dedup_key ?? incident.dedupKey };
   }
 
-  async acknowledgeIncident(incidentId) {
-    const payload = {
-      routing_key: this.integrationKey,
-      event_action: 'acknowledge',
-      dedup_key: incidentId
-    };
-
-    try {
-      const response = await axios.post(
-        'https://events.pagerduty.com/v2/enqueue',
-        payload
-      );
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Error acknowledging PagerDuty incident:', error);
-      return { success: false, error: error.message };
+  private async transition(dedupKey: string, action: 'acknowledge' | 'resolve') {
+    const data = await this.sendEvent({ event_action: action, dedup_key: dedupKey });
+    const record = this.incidents.get(dedupKey);
+    if (record) {
+      record.status = action === 'acknowledge' ? 'acknowledged' : 'resolved';
+      record.lastEventAt = new Date().toISOString();
     }
+    if (action === 'resolve') this.lastSent.delete(dedupKey);
+    return { success: true, data };
   }
 
-  async resolveIncident(incidentId) {
-    const payload = {
-      routing_key: this.integrationKey,
-      event_action: 'resolve',
-      dedup_key: incidentId
-    };
+  acknowledgeIncident(dedupKey: string) { return this.transition(dedupKey, 'acknowledge'); }
+  resolveIncident(dedupKey: string) { return this.transition(dedupKey, 'resolve'); }
 
-    try {
-      const response = await axios.post(
-        'https://events.pagerduty.com/v2/enqueue',
-        payload
-      );
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Error resolving PagerDuty incident:', error);
-      return { success: false, error: error.message };
-    }
+  private restHeaders() {
+    return { Accept: 'application/vnd.pagerduty+json;version=2', Authorization: `Token token=${this.apiKey}` };
   }
 
-  async getIncidents(serviceId, status = 'triggered') {
-    const headers = {
-      'Accept': 'application/vnd.pagerduty+json;version=2',
-      'Authorization': `Token token=${this.apiKey}`
-    };
-
-    try {
-      const response = await axios.get(
-        `${this.baseUrl}/incidents`,
-        {
-          headers: headers,
-          params: {
-            service_ids: [serviceId],
-            statuses: [status]
-          }
-        }
-      );
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Error getting PagerDuty incidents:', error);
-      return { success: false, error: error.message };
-    }
+  async getIncidents(serviceId: string, status = 'triggered') {
+    const params = new URLSearchParams({ 'service_ids[]': serviceId, 'statuses[]': status });
+    return sinkRequest('pagerduty', this.breaker, `${this.baseUrl}/incidents?${params}`, { headers: this.restHeaders() });
   }
 
-  async createService(serviceConfig) {
-    const headers = {
-      'Accept': 'application/vnd.pagerduty+json;version=2',
-      'Content-Type': 'application/json',
-      'Authorization': `Token token=${this.apiKey}`
-    };
-
-    const payload = {
-      service: {
-        name: serviceConfig.name,
-        type: serviceConfig.type || 'api',
-        description: serviceConfig.description || '',
-        escalation_policy: serviceConfig.escalationPolicy
-      }
-    };
-
-    try {
-      const response = await axios.post(
-        `${this.baseUrl}/services`,
-        payload,
-        { headers }
-      );
-      return { success: true, data: response.data };
-    } catch (error) {
-      console.error('Error creating PagerDuty service:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  async triggerErrorAlert(error, context = {}) {
-    return this.triggerIncident({
-      summary: `Error in Node API: ${error.message}`,
-      severity: 'critical',
-      source: 'node-api',
-      dedupKey: `error-${error.message}`,
-      details: {
-        error: error.message,
-        stack: error.stack,
-        ...context
-      }
+  async createService(service: { name: string; description?: string; escalationPolicyId: string }) {
+    return sinkRequest('pagerduty', this.breaker, `${this.baseUrl}/services`, {
+      headers: this.restHeaders(),
+      body: {
+        service: {
+          name: service.name,
+          type: 'service',
+          description: service.description ?? '',
+          escalation_policy: { id: service.escalationPolicyId, type: 'escalation_policy_reference' },
+        },
+      },
     });
   }
 
-  async triggerHighLatencyAlert(latency, threshold, context = {}) {
+  triggerErrorAlert(error: Error, context: Record<string, unknown> = {}) {
     return this.triggerIncident({
-      summary: `High latency detected: ${latency}ms (threshold: ${threshold}ms)`,
+      summary: `Error in ${config.serviceName}: ${error.message}`,
+      severity: 'critical',
+      dedupKey: `error-${context.route ?? 'unknown'}-${error.name}`,
+      details: { error: error.message, stack: error.stack, ...context },
+    });
+  }
+
+  triggerHighLatencyAlert(latencyMs: number, thresholdMs: number, context: Record<string, unknown> = {}) {
+    return this.triggerIncident({
+      summary: `High latency on ${context.route ?? 'unknown'}: ${Math.round(latencyMs)}ms (threshold ${thresholdMs}ms)`,
       severity: 'warning',
-      source: 'node-api',
-      dedupKey: `latency-${context.endpoint || 'unknown'}`,
-      details: {
-        latency: latency,
-        threshold: threshold,
-        ...context
-      }
+      dedupKey: `latency-${context.route ?? 'unknown'}`,
+      details: { latencyMs, thresholdMs, ...context },
     });
   }
 
-  async triggerHighErrorRateAlert(errorRate, threshold, context = {}) {
+  triggerHighErrorRateAlert(errorRatePct: number, thresholdPct: number, context: Record<string, unknown> = {}) {
     return this.triggerIncident({
-      summary: `High error rate detected: ${errorRate}% (threshold: ${threshold}%)`,
+      summary: `High error rate: ${errorRatePct.toFixed(1)}% (threshold ${thresholdPct}%)`,
       severity: 'critical',
-      source: 'node-api',
-      dedupKey: `error-rate-${context.endpoint || 'unknown'}`,
-      details: {
-        errorRate: errorRate,
-        threshold: threshold,
-        ...context
-      }
+      dedupKey: `error-rate-${context.scope ?? 'api'}`,
+      details: { errorRatePct, thresholdPct, ...context },
     });
+  }
+
+  listIncidents(): IncidentRecord[] {
+    return [...this.incidents.values()].sort((a, b) => b.lastEventAt.localeCompare(a.lastEventAt));
   }
 }
-
-module.exports = PagerDutyService;

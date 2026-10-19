@@ -1,0 +1,12 @@
+node_modules/
+dist/
+logs/
+uploads/
+coverage/
+.env
+.env.*
+!.env.example
+*.log
+frontend-test/.next/
+frontend-test/node_modules/
+frontend-test/next-env.d.ts

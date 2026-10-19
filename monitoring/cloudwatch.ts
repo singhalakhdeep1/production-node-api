@@ -1,151 +1,200 @@
-// AWS CloudWatch integration for production-node-api
+// AWS CloudWatch integration: per-minute request metrics, log shipping and alarms (AWS SDK v3).
+import {
+  CloudWatchClient,
+  GetMetricStatisticsCommand,
+  PutMetricAlarmCommand,
+  PutMetricDataCommand,
+  type ComparisonOperator,
+  type Dimension,
+  type MetricDatum,
+  type StandardUnit,
+} from '@aws-sdk/client-cloudwatch';
+import {
+  CloudWatchLogsClient,
+  CreateLogGroupCommand,
+  CreateLogStreamCommand,
+  PutLogEventsCommand,
+} from '@aws-sdk/client-cloudwatch-logs';
+import Transport from 'winston-transport';
+import { config } from '../src/config';
+import { externalSinkRequests } from '../src/metrics';
+import type { RequestSample } from '../src/observability/hooks';
+import { CircuitBreakerService } from '../src/services/circuit-breaker/circuit-breaker.service';
 
-const AWS = require('aws-sdk');
+interface Aggregate {
+  count: number;
+  errors: number;
+  sum: number;
+  min: number;
+  max: number;
+}
 
-class CloudWatchService {
-  constructor(region = 'us-east-1') {
-    this.cloudwatch = new AWS.CloudWatch({ region: region });
-    this.cloudwatchLogs = new AWS.CloudWatchLogs({ region: region });
+export class CloudWatchService {
+  readonly cloudwatch: CloudWatchClient;
+  readonly cloudwatchLogs: CloudWatchLogsClient;
+  readonly breaker = new CircuitBreakerService({ name: 'cloudwatch', failureThreshold: 3, resetTimeout: 60000 });
+  private aggregates = new Map<string, Aggregate>();
+  private timer: NodeJS.Timeout | null = null;
+  private ensuredStreams = new Set<string>();
+  published = 0;
+
+  constructor(region = config.monitoring.cloudwatchRegion, private readonly namespace = config.monitoring.cloudwatchNamespace) {
+    const endpoint = config.monitoring.cloudwatchEndpoint;
+    this.cloudwatch = new CloudWatchClient({ region, endpoint });
+    this.cloudwatchLogs = new CloudWatchLogsClient({ region, endpoint });
   }
 
-  async putMetric(metricName, value, namespace = 'NodeAPI', dimensions = []) {
-    const params = {
-      Namespace: namespace,
-      MetricData: [
-        {
-          MetricName: metricName,
-          Value: value,
-          Timestamp: new Date(),
-          Dimensions: dimensions
-        }
-      ]
-    };
-
+  private async call<T>(op: () => Promise<T>): Promise<T> {
     try {
-      await this.cloudwatch.putMetricData(params).promise();
-      return { success: true };
+      const result = await this.breaker.execute(op);
+      externalSinkRequests.inc({ sink: 'cloudwatch', result: 'success' });
+      return result;
     } catch (error) {
-      console.error('Error sending metric to CloudWatch:', error);
-      return { success: false, error: error.message };
+      externalSinkRequests.inc({ sink: 'cloudwatch', result: 'failure' });
+      throw error;
     }
   }
 
-  async putCustomMetric(metricName, value, unit = 'Count', dimensions = []) {
-    return this.putMetric(metricName, value, 'NodeAPI/Custom', dimensions);
+  async putMetric(metricName: string, value: number, unit: StandardUnit = 'Count', dimensions: Dimension[] = [], namespace = this.namespace) {
+    return this.putMetricData([{ MetricName: metricName, Value: value, Unit: unit, Timestamp: new Date(), Dimensions: dimensions }], namespace);
   }
 
-  async createLogGroup(logGroupName) {
-    const params = {
-      logGroupName: logGroupName
-    };
+  async putCustomMetric(metricName: string, value: number, unit: StandardUnit = 'Count', dimensions: Dimension[] = []) {
+    return this.putMetric(metricName, value, unit, dimensions, `${this.namespace}/Custom`);
+  }
 
+  async putMetricData(data: MetricDatum[], namespace = this.namespace) {
+    for (let i = 0; i < data.length; i += 1000) {
+      await this.call(() => this.cloudwatch.send(new PutMetricDataCommand({ Namespace: namespace, MetricData: data.slice(i, i + 1000) })));
+    }
+    this.published += data.length;
+    return { success: true };
+  }
+
+  async createLogGroup(logGroupName: string) {
     try {
-      await this.cloudwatchLogs.createLogGroup(params).promise();
+      await this.call(() => this.cloudwatchLogs.send(new CreateLogGroupCommand({ logGroupName })));
       return { success: true };
     } catch (error) {
-      if (error.code === 'ResourceAlreadyExistsException') {
-        return { success: true, exists: true };
-      }
-      console.error('Error creating log group:', error);
-      return { success: false, error: error.message };
+      if ((error as { name?: string }).name === 'ResourceAlreadyExistsException') return { success: true, exists: true };
+      throw error;
     }
   }
 
-  async putLogEvents(logGroupName, logEvents) {
-    const params = {
-      logGroupName: logGroupName,
-      logEvents: logEvents.map(event => ({
-        message: JSON.stringify(event),
-        timestamp: event.timestamp || Date.now()
-      }))
-    };
-
+  private async ensureStream(logGroupName: string, logStreamName: string): Promise<void> {
+    const id = `${logGroupName}/${logStreamName}`;
+    if (this.ensuredStreams.has(id)) return;
+    await this.createLogGroup(logGroupName);
     try {
-      await this.cloudwatchLogs.putLogEvents(params).promise();
-      return { success: true };
+      await this.call(() => this.cloudwatchLogs.send(new CreateLogStreamCommand({ logGroupName, logStreamName })));
     } catch (error) {
-      console.error('Error sending logs to CloudWatch:', error);
-      return { success: false, error: error.message };
+      if ((error as { name?: string }).name !== 'ResourceAlreadyExistsException') throw error;
     }
+    this.ensuredStreams.add(id);
   }
 
-  async getMetricStatistics(metricName, namespace = 'NodeAPI', period = 300) {
-    const params = {
-      Namespace: namespace,
+  async putLogEvents(logGroupName: string, events: { message: string; timestamp?: number }[], logStreamName = `${config.serviceName}-${config.instance}`) {
+    await this.ensureStream(logGroupName, logStreamName);
+    const logEvents = events.map((e) => ({ message: e.message, timestamp: e.timestamp ?? Date.now() })).sort((a, b) => a.timestamp - b.timestamp);
+    await this.call(() => this.cloudwatchLogs.send(new PutLogEventsCommand({ logGroupName, logStreamName, logEvents })));
+    return { success: true };
+  }
+
+  async getMetricStatistics(metricName: string, period = 300, dimensions: Dimension[] = []) {
+    const result = await this.call(() => this.cloudwatch.send(new GetMetricStatisticsCommand({
+      Namespace: this.namespace,
       MetricName: metricName,
+      Dimensions: dimensions,
       StartTime: new Date(Date.now() - 3600000),
       EndTime: new Date(),
       Period: period,
-      Statistics: ['Average', 'Maximum', 'Minimum', 'SampleCount']
-    };
-
-    try {
-      const result = await this.cloudwatch.getMetricStatistics(params).promise();
-      return { success: true, data: result.Datapoints };
-    } catch (error) {
-      console.error('Error getting metric statistics:', error);
-      return { success: false, error: error.message };
-    }
+      Statistics: ['Average', 'Maximum', 'Minimum', 'SampleCount', 'Sum'],
+    })));
+    return result.Datapoints ?? [];
   }
 
-  async createAlarm(alarmName, metricName, threshold, comparisonOperator) {
-    const params = {
+  async createAlarm(alarmName: string, metricName: string, threshold: number, comparisonOperator: ComparisonOperator, alarmActions: string[] = []) {
+    await this.call(() => this.cloudwatch.send(new PutMetricAlarmCommand({
       AlarmName: alarmName,
       AlarmDescription: `Alert for ${metricName}`,
-      Namespace: 'NodeAPI',
+      Namespace: this.namespace,
       MetricName: metricName,
       Threshold: threshold,
       ComparisonOperator: comparisonOperator,
       EvaluationPeriods: 1,
       Period: 300,
-      Statistic: 'Average'
-    };
-
-    try {
-      await this.cloudwatch.putMetricAlarm(params).promise();
-      return { success: true };
-    } catch (error) {
-      console.error('Error creating alarm:', error);
-      return { success: false, error: error.message };
-    }
+      Statistic: 'Average',
+      AlarmActions: alarmActions,
+    })));
+    return { success: true };
   }
 
-  async logRequest(req, res, next) {
-    const logEvent = {
-      method: req.method,
-      url: req.url,
-      statusCode: res.statusCode,
-      responseTime: res.responseTime,
-      userAgent: req.headers['user-agent'],
-      ip: req.ip
-    };
-
-    await this.putLogEvents('node-api-logs', [logEvent]);
-    next();
+  /** Request hook: aggregates in memory; `flush()` publishes one datum set per route per minute. */
+  record(sample: RequestSample): void {
+    const key = `${sample.method} ${sample.route}`;
+    const agg = this.aggregates.get(key) ?? { count: 0, errors: 0, sum: 0, min: Infinity, max: 0 };
+    agg.count++;
+    if (sample.status >= 500) agg.errors++;
+    agg.sum += sample.durationMs;
+    agg.min = Math.min(agg.min, sample.durationMs);
+    agg.max = Math.max(agg.max, sample.durationMs);
+    this.aggregates.set(key, agg);
   }
 
-  async trackRequestCount(req, res, next) {
-    await this.putMetric('RequestCount', 1, 'NodeAPI', [
-      { Name: 'Method', Value: req.method },
-      { Name: 'Path', Value: req.path }
-    ]);
-    next();
+  start(intervalMs = 60000): void {
+    this.timer = setInterval(() => void this.flush().catch(() => undefined), intervalMs);
+    this.timer.unref();
   }
 
-  async trackResponseTime(req, res, next) {
-    const startTime = Date.now();
-    
-    res.on('finish', async () => {
-      const responseTime = Date.now() - startTime;
-      await this.putMetric('ResponseTime', responseTime, 'NodeAPI', [
-        { Name: 'Method', Value: req.method },
-        { Name: 'Path', Value: req.path },
-        { Name: 'StatusCode', Value: res.statusCode.toString() }
-      ]);
+  async flush(): Promise<number> {
+    if (this.aggregates.size === 0) return 0;
+    const snapshot = [...this.aggregates];
+    this.aggregates.clear();
+    const timestamp = new Date();
+    const data: MetricDatum[] = snapshot.flatMap(([key, agg]) => {
+      const [method, route] = key.split(' ');
+      const dims = [{ Name: 'Method', Value: method }, { Name: 'Route', Value: route }];
+      return [
+        { MetricName: 'RequestCount', Value: agg.count, Unit: 'Count', Timestamp: timestamp, Dimensions: dims },
+        { MetricName: 'ServerErrors', Value: agg.errors, Unit: 'Count', Timestamp: timestamp, Dimensions: dims },
+        {
+          MetricName: 'ResponseTime',
+          Unit: 'Milliseconds',
+          Timestamp: timestamp,
+          Dimensions: dims,
+          StatisticValues: { SampleCount: agg.count, Sum: agg.sum, Minimum: agg.min, Maximum: agg.max },
+        },
+      ] as MetricDatum[];
     });
-    
-    next();
+    await this.putMetricData(data);
+    return data.length;
   }
 }
 
-module.exports = CloudWatchService;
+/** Winston transport that ships logs to a CloudWatch Logs group in batches. */
+export class CloudWatchLogsTransport extends Transport {
+  private buffer: { message: string; timestamp: number }[] = [];
+  private timer: NodeJS.Timeout;
+
+  constructor(private readonly cw: CloudWatchService, private readonly logGroup: string, opts?: Transport.TransportStreamOptions) {
+    super(opts);
+    this.timer = setInterval(() => void this.flush(), 5000);
+    this.timer.unref();
+  }
+
+  log(info: Record<string, unknown>, callback: () => void): void {
+    if (this.buffer.length < 10000) this.buffer.push({ message: JSON.stringify(info), timestamp: Date.now() });
+    callback();
+  }
+
+  async flush(): Promise<void> {
+    if (this.buffer.length === 0) return;
+    const batch = this.buffer.splice(0, 1000);
+    await this.cw.putLogEvents(this.logGroup, batch).catch(() => undefined);
+  }
+
+  close(): void {
+    clearInterval(this.timer);
+    void this.flush();
+  }
+}

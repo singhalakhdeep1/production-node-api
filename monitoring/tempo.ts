@@ -1,132 +1,77 @@
-// Tempo tracing integration for production-node-api
+// Tempo tracing integration: exports the API's spans as OTLP/HTTP JSON and reads traces back.
+import { config } from '../src/config';
+import { CircuitBreakerService } from '../src/services/circuit-breaker/circuit-breaker.service';
+import type { AttributeValue, FinishedSpan } from '../src/tracing/tracer';
+import { sinkRequest } from './http';
 
-const axios = require('axios');
+const KIND = { internal: 1, server: 2, client: 3 } as const;
+const STATUS = { unset: 0, ok: 1, error: 2 } as const;
 
-class TempoService {
-  constructor(tempoUrl = 'http://localhost:3200') {
-    this.tempoUrl = tempoUrl;
-  }
+const attr = (key: string, value: AttributeValue) => ({
+  key,
+  value: typeof value === 'boolean'
+    ? { boolValue: value }
+    : typeof value === 'number'
+      ? Number.isInteger(value) ? { intValue: String(value) } : { doubleValue: value }
+      : { stringValue: value },
+});
 
-  async sendTrace(trace) {
-    try {
-      await axios.post(`${this.tempoUrl}/api/v1/traces`, trace, {
-        headers: {
-          'Content-Type': 'application/json'
-        }
-      });
-      return { success: true };
-    } catch (error) {
-      console.error('Error sending trace to Tempo:', error);
-      return { success: false, error: error.message };
-    }
-  }
+export class TempoService {
+  readonly breaker = new CircuitBreakerService({ name: 'tempo', failureThreshold: 3, resetTimeout: 30000 });
 
-  async getTrace(traceId) {
-    try {
-      const response = await axios.get(`${this.tempoUrl}/api/traces/${traceId}`);
-      return response.data;
-    } catch (error) {
-      console.error('Error getting trace from Tempo:', error);
-      return { success: false, error: error.message };
-    }
-  }
+  /**
+   * @param otlpUrl  Tempo's OTLP/HTTP receiver, e.g. http://tempo:4318
+   * @param queryUrl Tempo's HTTP API, e.g. http://tempo:3200
+   */
+  constructor(private readonly otlpUrl: string, private readonly queryUrl: string) {}
 
-  async searchTraces(query) {
-    try {
-      const response = await axios.get(`${this.tempoUrl}/api/search`, {
-        params: query
-      });
-      return response.data;
-    } catch (error) {
-      console.error('Error searching traces in Tempo:', error);
-      return { success: false, error: error.message };
-    }
-  }
-
-  createSpan(operationName, parentSpanId = null, startTime = Date.now()) {
+  toOtlp(spans: FinishedSpan[]) {
     return {
-      traceID: this._generateTraceId(),
-      spanID: this._generateSpanId(),
-      parentSpanID: parentSpanId,
-      operationName: operationName,
-      startTime: startTime,
-      duration: 0,
-      tags: [],
-      logs: []
+      resourceSpans: [{
+        resource: {
+          attributes: [
+            attr('service.name', config.serviceName),
+            attr('service.version', config.version),
+            attr('service.instance.id', config.instance),
+            attr('deployment.environment', config.env),
+          ],
+        },
+        scopeSpans: [{
+          scope: { name: 'production-node-api', version: config.version },
+          spans: spans.map((s) => ({
+            traceId: s.traceId,
+            spanId: s.spanId,
+            parentSpanId: s.parentSpanId ?? '',
+            name: s.name,
+            kind: KIND[s.kind],
+            startTimeUnixNano: s.startTimeUnixNano.toString(),
+            endTimeUnixNano: s.endTimeUnixNano.toString(),
+            attributes: Object.entries(s.attributes).map(([k, v]) => attr(k, v)),
+            events: s.events.map((e) => ({
+              name: e.name,
+              timeUnixNano: e.timeUnixNano.toString(),
+              attributes: Object.entries(e.attributes ?? {}).map(([k, v]) => attr(k, v)),
+            })),
+            status: { code: STATUS[s.status.code], message: s.status.message ?? '' },
+          })),
+        }],
+      }],
     };
   }
 
-  finishSpan(span, tags = [], logs = []) {
-    span.duration = Date.now() - span.startTime;
-    span.tags = tags;
-    span.logs = logs;
-    return span;
+  async sendSpans(spans: FinishedSpan[]): Promise<void> {
+    if (spans.length === 0) return;
+    await sinkRequest('tempo', this.breaker, `${this.otlpUrl}/v1/traces`, { body: this.toOtlp(spans) });
   }
 
-  async sendSpan(span) {
-    const trace = {
-      resourceSpans: [
-        {
-          resource: {
-            attributes: [
-              { key: 'service.name', value: 'node-api' },
-              { key: 'service.version', value: '1.0.0' }
-            ]
-          },
-          scopeSpans: [
-            {
-              scope: {
-                name: 'node-api'
-              },
-              spans: [span]
-            }
-          ]
-        }
-      ]
-    };
-    return this.sendTrace(trace);
+  async getTrace(traceId: string) {
+    if (!/^[\da-f]{32}$/i.test(traceId)) throw new Error('traceId must be 32 hex characters');
+    return sinkRequest('tempo', this.breaker, `${this.queryUrl}/api/traces/${traceId}`);
   }
 
-  _generateTraceId() {
-    return Array.from({ length: 16 }, () => 
-      Math.floor(Math.random() * 16).toString(16)
-    ).join('');
-  }
-
-  _generateSpanId() {
-    return Array.from({ length: 8 }, () => 
-      Math.floor(Math.random() * 16).toString(16)
-    ).join('');
-  }
-
-  async traceMiddleware(req, res, next) {
-    const span = this.createSpan(`${req.method} ${req.path}`);
-    req.span = span;
-    
-    const startTime = Date.now();
-    
-    res.on('finish', () => {
-      const tags = [
-        { key: 'http.method', value: req.method },
-        { key: 'http.url', value: req.url },
-        { key: 'http.status_code', value: res.statusCode.toString() }
-      ];
-      
-      const logs = [
-        {
-          timestamp: Date.now(),
-          fields: [
-            { key: 'message', value: 'Request completed' }
-          ]
-        }
-      ];
-      
-      this.finishSpan(span, tags, logs);
-      this.sendSpan(span);
-    });
-    
-    next();
+  /** Tempo search, e.g. { tags: 'service.name=production-api', minDuration: '100ms', limit: 20 }. */
+  async searchTraces(query: Record<string, string | number>) {
+    const params = new URLSearchParams(Object.entries(query).map(([k, v]): [string, string] => [k, String(v)]));
+    return sinkRequest('tempo', this.breaker, `${this.queryUrl}/api/search?${params}`);
   }
 }
-
-module.exports = TempoService;
