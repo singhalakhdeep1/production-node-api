@@ -10,3 +10,4 @@ coverage/
 frontend-test/.next/
 frontend-test/node_modules/
 frontend-test/next-env.d.ts
+*.tsbuildinfo
